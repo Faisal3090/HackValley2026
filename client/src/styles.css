@@ -939,6 +939,8 @@ h4 {
 }
 
 .simulation-status { margin-top: 10px; padding: 9px 11px; border-radius: 10px; background: #eff6ff; color: #1d4ed8; font-size: 13px; font-weight: 700; }
+.driver-demo-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.connection-loss-badge { padding: 7px 9px; border-radius: 999px; background: #fef2f2; color: #b91c1c; font-size: 12px; font-weight: 700; }
 
 .estimate-value { transition: color 180ms ease, transform 180ms ease; }
 .fare-refresh-row { min-height: 24px; }

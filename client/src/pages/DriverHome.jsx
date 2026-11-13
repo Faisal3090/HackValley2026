@@ -22,11 +22,16 @@ export default function DriverHome() {
   const [cancelling, setCancelling] = useState(false);
   const [simulationRunning, setSimulationRunning] = useState(false);
   const [simulationStep, setSimulationStep] = useState('');
+  const [automaticDemo, setAutomaticDemo] = useState(false);
+  const [heartbeatPaused, setHeartbeatPaused] = useState(false);
+  const [offlineSeconds, setOfflineSeconds] = useState(0);
+  const autoStartedRideRef = useRef(null);
+  const heartbeatLostAtRef = useRef(null);
 
   const lastRouteKeyRef = useRef('');
 
   const pollDriverState = useCallback(async () => {
-    if (!token) return;
+    if (!token || heartbeatPaused) return;
     try {
       const [meRes, offerRes, activeRes] = await Promise.all([
         apiRequest('/drivers/me', { token }),
@@ -39,13 +44,26 @@ export default function DriverHome() {
     } catch {
       // Ignore transient polling failures
     }
-  }, [token, setDriver]);
+  }, [token, setDriver, heartbeatPaused]);
 
   useEffect(() => {
     void pollDriverState();
     const timer = setInterval(() => void pollDriverState(), 1500);
     return () => clearInterval(timer);
   }, [pollDriverState]);
+
+  useEffect(() => {
+    if (!heartbeatPaused) {
+      setOfflineSeconds(0);
+      heartbeatLostAtRef.current = null;
+      return undefined;
+    }
+    heartbeatLostAtRef.current = Date.now();
+    const timer = setInterval(() => {
+      setOfflineSeconds(Math.floor((Date.now() - heartbeatLostAtRef.current) / 1000));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [heartbeatPaused]);
 
   useEffect(() => {
     if (!token || !activeRide) {
@@ -189,6 +207,24 @@ export default function DriverHome() {
     }
   };
 
+  useEffect(() => {
+    if (!automaticDemo || !activeRide || activeRide.status !== 'ACCEPTED' || simulationRunning) return;
+    if (autoStartedRideRef.current === activeRide.id) return;
+    autoStartedRideRef.current = activeRide.id;
+    void runFullRideSimulation();
+  }, [automaticDemo, activeRide?.id, activeRide?.status, simulationRunning]);
+
+  const toggleConnectionSimulation = () => {
+    if (heartbeatPaused) {
+      setHeartbeatPaused(false);
+      setInfo('Driver connection restored. Heartbeat updates resumed.');
+      void pollDriverState();
+      return;
+    }
+    setHeartbeatPaused(true);
+    setInfo('Simulated internet loss. If this lasts beyond the timeout, the passenger will be reassigned.');
+  };
+
   const isBusyOnRide = driver?.status === 'BUSY';
   const isAvailable = driver?.status === 'AVAILABLE';
 
@@ -268,6 +304,12 @@ export default function DriverHome() {
                       : 'Unset'}
                   </span>
                 </div>
+                <div className="driver-demo-controls">
+                  <button type="button" className={`btn btn-sm ${automaticDemo ? 'btn-success' : ''}`} onClick={() => setAutomaticDemo((value) => !value)}>
+                    {automaticDemo ? 'Automatic Demo: ON' : 'Enable Automatic Demo'}
+                  </button>
+                  {heartbeatPaused && <span className="connection-loss-badge">Connection lost · {offlineSeconds}s</span>}
+                </div>
               </>
             )}
           </div>
@@ -336,6 +378,11 @@ export default function DriverHome() {
               {['ACCEPTED', 'ARRIVING'].includes(activeRide.status) && (
                 <button type="button" className="btn btn-danger" style={{ marginTop: '10px' }} disabled={busy || cancelling} onClick={() => void handleDriverCancel()}>
                   {cancelling ? 'Reassigning...' : 'Cancel & Reassign Ride'}
+                </button>
+              )}
+              {activeRide && ['ACCEPTED', 'ARRIVING'].includes(activeRide.status) && (
+                <button type="button" className="btn btn-warning" style={{ marginTop: '10px' }} disabled={simulationRunning} onClick={toggleConnectionSimulation}>
+                  {heartbeatPaused ? 'Reconnect Driver' : 'Simulate Internet Loss'}
                 </button>
               )}
             </div>
