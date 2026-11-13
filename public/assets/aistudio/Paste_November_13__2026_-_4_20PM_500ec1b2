@@ -1,0 +1,521 @@
+# MASTER PROMPT: Build an Extensible Ride Matching Platform (React + Node/Express + PostgreSQL + Leaflet/OSM)
+
+Paste everything below into your AI coding tool. The AI builds in **three phases** and stops for confirmation at the end of each.
+
+---
+
+## 0. HOW YOU (THE AI) SHOULD WORK
+
+- You are a senior full-stack engineer helping me finish a hackathon MVP in about 18 hours. Quality and demo-ability beat feature count.
+- Build **one phase at a time** (Phase 1, 2, 3). Inside a phase, work through the numbered steps in order. After each phase: summarize what you built, list exact commands to run and verify it, state any assumptions, and **wait for me to say "continue"**.
+- Write complete, runnable code. No `// TODO implement` placeholders. If something is intentionally deferred, leave a clearly named extension point and say so.
+- Prefer simple, boring solutions. Do not add libraries, services, or features that are not listed.
+- Show the full contents of every file you create or change, with its path.
+- Do not invent benchmark numbers or claim performance results.
+- If a requirement is ambiguous, pick the simplest reasonable option, state the assumption in one line, and continue.
+
+---
+
+## 1. PROJECT CONTEXT
+
+A hackathon ride-hailing platform. The MVP must deliver a **complete, demo-able booking flow** (10 core requirements below) **and** a dispatch engine designed so that more advanced features can be added later **without rewriting the core**:
+
+- Fairness-aware driver scoring (fairness debt, workload, reliability, compatibility)
+- Adaptive scoring weights based on demand
+- Explainable driver selection
+- Automatic reassignment and ride exception handling (reject, timeout, cancel, delay)
+- Simulation comparing nearest-driver vs fairness-aware allocation
+- Zone intelligence / surge pricing, ride pooling, and other future features
+
+**Core principles**
+1. The basic booking flow must always work, even when every advanced feature is disabled or throws an error.
+2. Every feature must be demonstrable in under 30 seconds and safely switchable off by config.
+3. Teammates build other modules in parallel, so this system must be usable stand-alone with **seeded demo data** and expose clean, versioned APIs (`/api/v1/`).
+
+### The 10 core requirements (all must work)
+
+| # | Requirement | Spec section |
+|---|---|---|
+| 1 | Passenger and driver registration/login | 5.1, 7.2 |
+| 2 | Drivers update availability status | 7.3, 9.3 |
+| 3 | Passengers enter pickup and destination | 7.5, 9.2 |
+| 4 | Display available nearby drivers | 7.4, 9.2 |
+| 5 | Calculate distance between passenger and drivers | 6.3, 7.4 |
+| 6 | Match passenger with a suitable available driver | 8.3 to 8.5 |
+| 7 | Estimated pickup time and approximate fare | 6.3, 6.4, 7.5 |
+| 8 | Drivers accept or reject ride requests | 8.5, 9.3 |
+| 9 | Ride states: Requested, Accepted, Arriving, Ongoing, Completed | 4, 8.6 |
+| 10 | Ride history and fare details | 7.7, 9.4 |
+
+---
+
+## 2. TECH STACK (FIXED)
+
+| Layer | Technology |
+|---|---|
+| Frontend | React 18 (Vite), react-router-dom, react-leaflet + Leaflet, plain `fetch` (no Redux, no UI kit) |
+| Backend | Node.js 20+, Express, **ES modules** (`"type": "module"`) |
+| Database | PostgreSQL 14+ using `pg` (node-postgres) with **raw parameterized SQL** (no ORM, so conditional updates stay explicit) |
+| Auth | JWT (`jsonwebtoken`) + `bcryptjs` |
+| Validation | `zod` |
+| Config | `dotenv` + a validated `config` module |
+| Mapping/routing | Leaflet + OpenStreetMap tiles; **OSRM public demo server** for road routes/ETA, with automatic haversine fallback |
+| Tests | `vitest` + `supertest` |
+| Background work | A separate Node script (`npm run worker`) looping every second. **No** Redis, Kafka, Celery-style queues, or WebSockets in the MVP |
+| Live updates | Frontend polling every 1.5 seconds |
+
+Not allowed in the MVP: ORMs, GraphQL, Redux, PostGIS, Docker requirements (a docker-compose for Postgres is optional), payment gateways.
+
+---
+
+## 3. NON-NEGOTIABLE DESIGN RULES
+
+1. **Swappable ranker.** All driver ranking goes through `ranker.rank(ctx)`. The MVP ships `NearestRanker`. Adding `FairRanker` later must require only a new file and a registry entry.
+2. **Single place for state changes.** Every ride/offer transition lives in `server/src/services/` (`offers.js`, `rides.js`, `recovery.js`). Route handlers never write status directly.
+3. **Race-safe transitions.** Use conditional SQL updates (`UPDATE ... WHERE id=$1 AND status='PENDING' ... RETURNING *`) inside a transaction and check `rowCount`. Never read-then-write for status. A late accept after expiry must return HTTP 409 and change nothing.
+4. **Everything writes an event.** Each action inserts a `ride_events` row **inside the same transaction** as the state change. After commit, the event is published on an in-process event bus.
+5. **Extensibility through registries and pipelines**, not edits to core files (see Section 10).
+6. **Offered is not assigned.** A ride becomes `ACCEPTED` only after explicit driver acceptance. Offering is the separate state `DRIVER_OFFERED`.
+7. **Graceful degradation.** If a ranker, the routing service, or zone intelligence fails or times out, matching continues using nearest-driver and haversine defaults. Log a warning; never fail the ride request because of an optional component.
+8. **Config over code.** Timeouts, attempts, radius, speeds, fare parameters, ranker name, feature flags: all environment-configurable.
+9. **Role-based permissions** and ownership checks on every endpoint (see 7.6).
+10. **API versioning.** Every endpoint lives under `/api/v1/`. Every error is JSON `{ "error": "message", "code": "SOME_CODE" }`.
+
+---
+
+## 4. RIDE STATE MACHINE
+
+```
+REQUESTED -> DRIVER_OFFERED -> ACCEPTED -> ARRIVING -> ONGOING -> COMPLETED
+
+Failure/recovery:
+DRIVER_OFFERED -> (offer REJECTED | EXPIRED) -> recovery -> DRIVER_OFFERED (next driver)
+recovery with no eligible drivers or attempts exhausted -> UNFULFILLED
+REQUESTED | DRIVER_OFFERED | ACCEPTED -> CANCELLED (by passenger)
+```
+
+Rules:
+- Forward-only progression `ACCEPTED -> ARRIVING -> ONGOING -> COMPLETED`; each step is a conditional update on the expected from-state and the assigned driver.
+- On `COMPLETED`: set `final_fare`, increment driver `rides_completed`, driver status returns to `AVAILABLE`.
+- On `CANCELLED` after acceptance: driver returns to `AVAILABLE`; any pending offer is expired.
+- A transition table (`const TRANSITIONS = {...}`) in one file is the single source of truth for allowed moves.
+
+**Events** (all share the envelope in 6.5): `RIDE_REQUESTED`, `DRIVER_RANKED`, `DRIVER_OFFERED`, `DRIVER_ACCEPTED`, `DRIVER_REJECTED`, `DRIVER_CANCELLED`, `OFFER_EXPIRED`, `DRIVER_ASSIGNED`, `RIDE_REASSIGNED`, `RIDE_STATUS_CHANGED`, `RIDE_UNFULFILLED`, `RIDE_CANCELLED`, `LATE_RESPONSE_REJECTED`.
+`DRIVER_ASSIGNED` is emitted at acceptance, and `RIDE_STATUS_CHANGED` on every status transition (payload `{from, to}`).
+
+---
+
+## 5. DATABASE (PostgreSQL)
+
+Plain `.sql` migration files in `server/src/db/migrations/` applied by a tiny runner (`npm run migrate`) that records applied files in a `schema_migrations` table. Use `TEXT` with `CHECK` constraints instead of enum types (easier to change later).
+
+### 5.1 Tables
+
+**users**: `id SERIAL PK`, `username TEXT UNIQUE NOT NULL`, `password_hash TEXT NOT NULL`, `role TEXT CHECK IN ('passenger','driver','admin')`, `name TEXT`, `phone TEXT`, `created_at TIMESTAMPTZ DEFAULT now()`
+
+**drivers**: `id SERIAL PK`, `user_id INT UNIQUE REFERENCES users`, `vehicle_type TEXT CHECK IN ('AUTO','HATCHBACK','SEDAN','SUV')`, `vehicle_number TEXT`, `lat DOUBLE PRECISION`, `lng DOUBLE PRECISION`, `status TEXT CHECK IN ('OFFLINE','AVAILABLE','BUSY') DEFAULT 'OFFLINE'`, `online_since TIMESTAMPTZ`, `last_heartbeat TIMESTAMPTZ`, `offers_received INT DEFAULT 0`, `rides_completed INT DEFAULT 0`, `accept_rate NUMERIC(3,2) DEFAULT 0.80`
+
+**rides**: `id SERIAL PK`, `passenger_id INT REFERENCES users`, `pickup_lat, pickup_lng, pickup_label`, `drop_lat, drop_lng, drop_label`, `vehicle_type TEXT NULL`, `status TEXT CHECK IN ('REQUESTED','DRIVER_OFFERED','ACCEPTED','ARRIVING','ONGOING','COMPLETED','UNFULFILLED','CANCELLED')`, `version INT DEFAULT 0`, `attempt_count INT DEFAULT 0`, `current_driver_id INT NULL REFERENCES drivers`, `trip_distance_km NUMERIC`, `trip_duration_min NUMERIC`, `estimated_pickup_eta_min NUMERIC`, `estimated_fare NUMERIC`, `final_fare NUMERIC`, `fare_breakdown JSONB`, `zone_id TEXT NULL`, `created_at`, `accepted_at`, `arriving_at`, `started_at`, `completed_at`, `cancelled_at`
+
+**offers**: `id SERIAL PK`, `ride_id INT REFERENCES rides`, `driver_id INT REFERENCES drivers`, `status TEXT CHECK IN ('PENDING','ACCEPTED','REJECTED','EXPIRED')`, `expires_at TIMESTAMPTZ`, `version INT DEFAULT 0`, `rank_position INT`, `score NUMERIC`, `decision_id TEXT`, `created_at`, `responded_at`
+
+**ride_events**: `id BIGSERIAL PK`, `event_id UUID UNIQUE DEFAULT gen_random_uuid()`, `event_type TEXT`, `ride_id INT`, `driver_id INT NULL`, `offer_id INT NULL`, `payload JSONB DEFAULT '{}'`, `occurred_at TIMESTAMPTZ DEFAULT now()`
+
+**notifications**: `id SERIAL PK`, `user_id INT REFERENCES users`, `ride_id INT NULL`, `message TEXT`, `read BOOLEAN DEFAULT false`, `created_at`
+
+**idempotency_keys**: `key TEXT`, `user_id INT`, `endpoint TEXT`, `response_status INT`, `response_body JSONB`, `created_at`, `PRIMARY KEY (key, user_id, endpoint)`
+
+### 5.2 Constraints that enforce the rules in the database
+```sql
+-- at most one pending offer per ride
+CREATE UNIQUE INDEX one_pending_offer_per_ride ON offers(ride_id) WHERE status = 'PENDING';
+-- never offer the same ride to the same driver twice
+ALTER TABLE offers ADD CONSTRAINT one_offer_per_driver_per_ride UNIQUE (ride_id, driver_id);
+-- one active ride per passenger
+CREATE UNIQUE INDEX one_active_ride_per_passenger ON rides(passenger_id)
+  WHERE status IN ('REQUESTED','DRIVER_OFFERED','ACCEPTED','ARRIVING','ONGOING');
+-- a driver cannot be assigned to two active rides
+CREATE UNIQUE INDEX one_active_ride_per_driver ON rides(current_driver_id)
+  WHERE current_driver_id IS NOT NULL AND status IN ('ACCEPTED','ARRIVING','ONGOING');
+```
+Add indexes on `offers(status, expires_at)`, `rides(passenger_id, created_at)`, `ride_events(ride_id, occurred_at)`.
+
+---
+
+## 6. CONFIGURATION, GEO, ROUTING, FARE, EVENTS
+
+### 6.1 Config (`server/src/config/index.js`)
+Validated with zod, all env-overridable, with defaults:
+```
+PORT=4000
+DATABASE_URL, TEST_DATABASE_URL
+JWT_SECRET, JWT_EXPIRES_IN=7d
+OFFER_TIMEOUT_SECONDS=15
+MAX_ATTEMPTS=3
+SEARCH_RADIUS_KM=5
+AVG_SPEED_KMH=25
+RANKER=nearest                # nearest | fair (later)
+FAIR_DISPATCH_ENABLED=true    # false forces nearest-driver matching
+ROUTING_PROVIDER=osrm         # osrm | haversine
+OSRM_BASE_URL=https://router.project-osrm.org
+ROUTING_TIMEOUT_MS=2500
+FARE_BASE=50
+FARE_PER_KM=12
+FARE_VEHICLE_MULTIPLIER={"AUTO":0.8,"HATCHBACK":1.0,"SEDAN":1.2,"SUV":1.5}
+DEMO_MODE=true
+SERVICE_API_KEY=dev-service-key
+CITY_CENTER_LAT=15.8497
+CITY_CENTER_LNG=74.4977
+```
+
+### 6.2 Geo (`services/geo.js`)
+`haversineKm(a, b)` and `etaMinutes(distanceKm) = distanceKm / AVG_SPEED_KMH * 60`.
+
+### 6.3 Routing (`services/routing.js`) — mapping and routing requirement
+- `getRoute(from, to)` calls OSRM `route/v1/driving/{lng},{lat};{lng},{lat}?overview=full&geometries=geojson` and returns `{distanceKm, durationMin, geometry (GeoJSON LineString), source: "osrm"}`.
+- `getEtaMatrix(drivers, pickup)` makes **one** OSRM `table/v1/driving` call (many drivers to one pickup) and returns `{driverId: {distanceKm, etaMin}}`.
+- Both use a request timeout (`ROUTING_TIMEOUT_MS`), a small in-memory cache (key = rounded coordinates, short TTL), and **fall back to haversine** (distance times a 1.3 road factor, `source: "haversine"`) on any error, timeout, or when `ROUTING_PROVIDER=haversine`. Never throw to the caller.
+- Respect OSRM demo-server fair use: no polling the routing API from the frontend; cache aggressively.
+
+### 6.4 Fare (`services/fare.js`) with a modifier pipeline
+```
+baseFare = (FARE_BASE + FARE_PER_KM * tripDistanceKm) * vehicleMultiplier
+fare = round( modifiers.reduce((f, m) => m(f, ctx), baseFare) )
+```
+`modifiers` is an array exported from `hooks/fareModifiers.js` (empty or containing a zone-surge modifier that multiplies by `zone.surgeMultiplier`, default 1). Returns `{ total, breakdown }` where `breakdown` lists base, per-km, vehicle multiplier, and each modifier applied; stored in `rides.fare_breakdown`. Final fare equals the estimate in the MVP (state this assumption). Show fares in INR.
+
+### 6.5 Events (`services/events.js`)
+- Envelope: `{ eventId, eventType, occurredAt, rideId, driverId?, offerId?, payload }`.
+- `recordEvent(client, event)` inserts into `ride_events` using the **transaction client**.
+- `eventBus` is a Node `EventEmitter`. `publishAfterCommit(events)` emits after the transaction commits. Subscribers are registered in one place (`services/subscribers.js`): the **notifications subscriber** (writes friendly passenger messages such as "Driver Ravi accepted your ride", "No driver available, please try again") is the only MVP subscriber.
+- Consumers must tolerate duplicates (key on `eventId`).
+
+### 6.6 Zone intelligence stub (`services/zoneIntelligence.js`)
+`getZoneIntelligence(lat, lng)` returns the safe default `{ zoneId: null, demandLevel: "NORMAL", demandSupplyRatio: 1, surgeMultiplier: 1, generatedAt }` today. Wrapped in try/catch with a timeout so a future HTTP client to a teammate's service can replace it without touching callers.
+
+---
+
+## 7. BACKEND API (all under `/api/v1/`, JSON)
+
+### 7.1 Project layout
+```
+server/
+  package.json  .env.example
+  src/
+    app.js  server.js  worker.js
+    config/index.js
+    db/ pool.js  tx.js  migrate.js  migrations/*.sql
+    middleware/ auth.js  roles.js  validate.js  idempotency.js  errors.js
+    routes/ index.js auth.js drivers.js rides.js offers.js dispatch.js notifications.js dev.js
+    services/ geo.js routing.js fare.js zoneIntelligence.js
+              eligibility.js offers.js rides.js recovery.js
+              events.js subscribers.js notifications.js
+    rankers/ index.js (registry + rankWithFallback)  base.js  nearest.js
+    hooks/ eligibilityRules.js  fareModifiers.js  recoveryStrategies.js
+    seed/ seed.js
+  tests/ auth.test.js dispatch.test.js lifecycle.test.js extensibility.test.js
+simulation/README.md      # placeholder: future headless simulator reuses src/rankers
+client/                   # React app (Phase 3)
+```
+`db/tx.js` exports `withTransaction(fn)` (BEGIN/COMMIT/ROLLBACK, releases client, rethrows).
+
+### 7.2 Auth (requirement 1)
+| Endpoint | Behavior |
+|---|---|
+| `POST /auth/register` | Body `{username, password, role: "passenger"\|"driver", name, phone, vehicleType?, vehicleNumber?}`. Creates user (+ driver row, starts `OFFLINE` at the city center). Returns `{token, user}`. |
+| `POST /auth/login` | Returns `{token, user}`; 401 on bad credentials. |
+| `GET /auth/me` | Current user and, for drivers, driver profile. |
+
+JWT in `Authorization: Bearer <token>`. Passwords hashed with bcrypt. Middleware `requireAuth` and `requireRole(...)`.
+
+### 7.3 Driver endpoints (requirements 2, 8)
+| Endpoint | Role | Behavior |
+|---|---|---|
+| `POST /drivers/me/availability` | driver | `{available: boolean}` sets `AVAILABLE`/`OFFLINE`, sets `online_since` when going online; 409 if `BUSY`. |
+| `POST /drivers/me/location` | driver | `{lat, lng}`; updates position and `last_heartbeat`. |
+| `GET /drivers/me` | driver | Own profile and status. |
+| `GET /drivers/me/offer` | driver | Current `PENDING` offer with ride pickup/drop, trip distance, fare, `secondsLeft`, or `null`. |
+| `GET /drivers/me/active-ride` | driver | Ride in `ACCEPTED/ARRIVING/ONGOING`, or `null`. |
+
+### 7.4 Nearby drivers (requirements 4, 5)
+`GET /drivers/nearby?lat=&lng=&radiusKm=&vehicleType=` (passenger): `AVAILABLE` drivers within radius (haversine pre-filter, then `getEtaMatrix` for road distance/ETA), each `{id, name, lat, lng, vehicleType, distanceKm, etaMin}`, sorted by distance. No phone numbers exposed.
+
+### 7.5 Estimate and ride request (requirements 3, 6, 7)
+- `POST /rides/estimate` (passenger): body `{pickup:{lat,lng}, drop:{lat,lng}, vehicleType?}` returns `{tripDistanceKm, tripDurationMin, estimatedFare, fareBreakdown, nearestEtaMin, nearbyDriverCount, routeSource}`.
+- `POST /rides` (passenger, supports `Idempotency-Key` header): body adds optional `pickupLabel`, `dropLabel`. Creates the ride (`REQUESTED`), stores trip distance/duration/fare, records `RIDE_REQUESTED`, calls `createOffer`, stores `estimated_pickup_eta_min` from the first ranking, returns ride detail. 409 if the passenger already has an active ride (caught from the unique index).
+- `POST /rides/:id/cancel` (passenger, own ride).
+- `GET /rides/:id/route`: `{ driverToPickup?: GeoJSON, pickupToDrop: GeoJSON, source }` for map drawing.
+
+### 7.6 Permissions
+- Passenger: estimate/create/cancel/view **own** rides; view nearby drivers.
+- Driver: own availability, location, offers, active ride; respond only to **own** offers; advance only **own** rides.
+- Ride detail, events and ranking: the ride's passenger, the assigned/offered driver, admins, and any user when `DEMO_MODE=true`.
+- Unauthenticated: register and login only.
+
+### 7.7 Ride detail and history (requirement 10)
+- `GET /rides/:id` returns:
+```json
+{
+  "id": 1, "status": "DRIVER_OFFERED", "attemptCount": 1, "maxAttempts": 3,
+  "pickup": {"lat": 15.85, "lng": 74.50, "label": ""},
+  "drop": {"lat": 15.86, "lng": 74.52, "label": ""},
+  "tripDistanceKm": 2.4, "estimatedFare": 79, "finalFare": null,
+  "fareBreakdown": {}, "estimatedPickupEtaMin": 2.0, "currentDriver": null,
+  "currentOffer": {"id": 7, "driverId": 3, "driverName": "Driver 3", "status": "PENDING",
+                   "expiresAt": "...", "secondsLeft": 11.2},
+  "latestRanking": [
+    {"driverId": 3, "name": "Driver 3", "lat": 15.851, "lng": 74.501, "distanceKm": 0.8,
+     "etaMin": 1.9, "score": 84.0, "factors": {"distance": 84.0},
+     "reason": "Nearest available driver (0.8 km, ETA 2 min)", "selected": true}
+  ],
+  "lastExpiredOfferId": 6,
+  "timestamps": {"createdAt": "...", "acceptedAt": null, "arrivingAt": null, "startedAt": null, "completedAt": null}
+}
+```
+`latestRanking` comes from the most recent `DRIVER_RANKED` event payload.
+- `GET /rides/:id/events`: ordered event envelopes.
+- `GET /rides/history`: current user's rides (passenger: theirs; driver: assigned to them), newest first, each `{id, status, pickupLabel, dropLabel, tripDistanceKm, estimatedFare, finalFare, driverName, passengerName, createdAt, completedAt}`.
+- `GET /notifications` and `POST /notifications/:id/read` (current user).
+
+### 7.8 Dev/demo and integration endpoints
+- `POST /dev/reset` (only when `DEMO_MODE`): re-runs seeding.
+- `POST /dispatch/allocate` — **integration contract** with teammates' modules (auth: admin JWT or `X-Service-Key`). Stateless: it ranks, it does not create offers or touch ride state.
+  Request:
+  ```json
+  { "rideId": "RIDE-101", "pickup": {"latitude": 12.97, "longitude": 77.59},
+    "requirements": {"vehicleType": "SEDAN", "seats": 2},
+    "candidates": [{"driverId": "D101", "distanceKm": 1.2, "pickupEtaMinutes": 5, "online": true, "available": true}],
+    "zoneId": "ZONE-01" }
+  ```
+  Response:
+  ```json
+  { "rideId": "RIDE-101", "decisionId": "DEC-001", "selectedDriverId": "D102", "status": "OFFER_READY",
+    "rankedDrivers": [{"driverId": "D102", "score": 87.5, "reason": "...", "factors": {}}] }
+  ```
+  It runs the same eligibility pipeline and `rankWithFallback` as the internal flow; driver stats are loaded from the DB when the driver exists, otherwise safe defaults are used. The response is a *proposed* decision, never a confirmed assignment.
+
+---
+
+## 8. DISPATCH ENGINE SPEC
+
+### 8.1 Ranker interface (`rankers/base.js`, JSDoc types)
+```js
+/**
+ * @typedef {Object} Candidate   { driver, distanceKm, etaMin }
+ * @typedef {Object} RankContext { ride, candidates: Candidate[], zone, config, now }
+ * @typedef {Object} ScoredDriver
+ *   { driver, score /*0-100*/, distanceKm, etaMin, factors /*object*/, reason /*string*/ }
+ */
+export class DriverRanker { rank(ctx) /* -> ScoredDriver[] sorted best-first */ { throw new Error("not implemented"); } }
+```
+`NearestRanker`: `score = max(0, 100 * (1 - distanceKm / SEARCH_RADIUS_KM))`, sorted by distance ascending; `factors = {distance: score}`; `reason` like `"Nearest available driver (0.8 km, ETA 2 min)"`.
+
+`rankers/index.js`:
+- `registry = { nearest: new NearestRanker() }` and `registerRanker(name, instance)`.
+- `getRanker(name)` throws a clear error for unknown names.
+- `rankWithFallback(ctx)`: if `FAIR_DISPATCH_ENABLED` is false, use `nearest`; otherwise try the configured ranker, and on any exception log a warning and use `nearest`. Returns `{ranked, rankerUsed, fellBack}`.
+
+### 8.2 Config-driven weights hook
+`ctx.config.weights` is read by future rankers; the MVP exposes `RANKER_WEIGHTS` (JSON env, default `{}`) so adaptive weights can be injected later without a signature change.
+
+### 8.3 Eligibility (`services/eligibility.js`) with a rule pipeline
+`getEligibleCandidates(ride)`:
+1. Load `AVAILABLE` drivers; haversine pre-filter to `SEARCH_RADIUS_KM`.
+2. Run each rule from `hooks/eligibilityRules.js` (array of `(driver, ride, ctx) => boolean`). MVP rules: not already holding a `PENDING` offer; no existing offer row for **this** ride (rejected/expired/any); vehicle type matches when requested; heartbeat not stale (only if `last_heartbeat` exists and older than a configurable threshold, default disabled).
+3. Call `getEtaMatrix` for survivors (haversine fallback) and return `Candidate[]`.
+Hard eligibility always wins over scoring.
+
+### 8.4 Offer creation (`services/offers.js` → `createOffer(rideId)`)
+Inside `withTransaction`:
+1. `SELECT ... FROM rides WHERE id=$1 FOR UPDATE`. Skip if status is not `REQUESTED`/`DRIVER_OFFERED`-without-live-offer.
+2. Get candidates, fetch `getZoneIntelligence` (safe default), call `rankWithFallback`.
+3. Record `DRIVER_RANKED` with the full ranking (driverId, name, lat, lng, distanceKm, etaMin, score, factors, reason, `rankerUsed`, `fellBack`, `decisionId`).
+4. No candidates: go to the single `markUnfulfilled` helper.
+5. Else insert an offer for the top driver (`expires_at = now() + OFFER_TIMEOUT_SECONDS`, `rank_position=1`, `score`, `decision_id`), `drivers.offers_received += 1`, ride to `DRIVER_OFFERED` (`attempt_count+1`, `version+1`), record `DRIVER_OFFERED` and `RIDE_STATUS_CHANGED`.
+6. Publish events after commit.
+
+### 8.5 Responding and expiring
+- `respondToOffer(offerId, action, user)`:
+  - **Accept** (one transaction):
+    ```sql
+    UPDATE offers SET status='ACCEPTED', responded_at=now(), version=version+1
+    WHERE id=$1 AND status='PENDING' AND expires_at > now() RETURNING *;
+    ```
+    `rowCount = 0` means: if the offer is already `ACCEPTED` by the same driver return 200 `{idempotent:true}`; otherwise record `LATE_RESPONSE_REJECTED` and respond **409**. On success, conditionally update the ride (`WHERE id=$1 AND status='DRIVER_OFFERED'` → `ACCEPTED`, set `current_driver_id`, `accepted_at`, `version+1`), set driver `BUSY`, record `DRIVER_ACCEPTED`, `DRIVER_ASSIGNED`, `RIDE_STATUS_CHANGED`.
+  - **Reject:** conditional `PENDING → REJECTED` (same 409/idempotent logic), record `DRIVER_REJECTED`, then `recoverRide(rideId, "driver_rejected")`.
+  - Ownership: the offer's driver must be the caller unless `DEMO_MODE`.
+- `expireStaleOffers()`: select `PENDING` offers with `expires_at <= now()` using `FOR UPDATE SKIP LOCKED` (safe with several workers), conditionally set `EXPIRED`, record `OFFER_EXPIRED`, call `recoverRide(rideId, "offer_timeout")`. Only the transaction that changed the row proceeds.
+
+### 8.6 Recovery (`services/recovery.js`) with a strategy registry
+`recoverRide(rideId, reason)`: lock ride; return if already `ACCEPTED` or later, `UNFULFILLED`, or `CANCELLED`; look up `recoveryStrategies[reason] ?? recoveryStrategies.default`. The **default strategy** (the MVP behavior): if `attempt_count >= MAX_ATTEMPTS` call `markUnfulfilled`; else record `RIDE_REASSIGNED` `{reason, attempt}` and call `createOffer`; if `createOffer` finds no candidates it calls `markUnfulfilled`. `markUnfulfilled` is the only place that sets `UNFULFILLED` (records `RIDE_UNFULFILLED`, triggers the passenger notification). `hooks/recoveryStrategies.js` exports `{ default, driver_rejected?, offer_timeout?, ... }` so cancellation, delayed arrival, and radius expansion plug in later.
+
+### 8.7 Ride progress and cancel (`services/rides.js`)
+- `advanceRide(rideId, driverUserId)`: next state from the transition table; conditional update `WHERE id=$1 AND status=$from AND current_driver_id=$driver` setting status, timestamp, `version+1`; zero rows means 409 (or 403 if not the assigned driver). On `COMPLETED`: set `final_fare`, increment `rides_completed`, driver `AVAILABLE`. Records `RIDE_STATUS_CHANGED`.
+- `cancelRide(rideId, passengerId)`: conditional update to `CANCELLED` from `REQUESTED`/`DRIVER_OFFERED`/`ACCEPTED`; expire pending offer; free driver; record `RIDE_CANCELLED`.
+- Endpoint: `POST /rides/:id/advance` (assigned driver).
+
+### 8.8 Worker (`worker.js`)
+Loop every 1 second calling `expireStaleOffers()`; log when something expires; handle SIGINT/SIGTERM cleanly; never crash the loop on a single error. `npm run worker`.
+
+### 8.9 Seeding (`seed/seed.js`, `npm run seed`)
+Deterministic, no randomness: delete and recreate demo data. About 10 drivers within about 4 km of `CITY_CENTER`, mixed vehicle types, `AVAILABLE`, varied `offers_received` (0 to 12), `online_since` (30 to 300 minutes ago), `rides_completed`, `accept_rate`. Users `driver1..driver10`, `passenger1..passenger3`, and `admin`, password `demo1234`. Print the credentials.
+
+### 8.10 Idempotency middleware
+For `POST /rides` and `POST /offers/:id/respond`, if an `Idempotency-Key` header is present: look up `(key, user, endpoint)` and replay the stored response; otherwise run the handler and store the response.
+
+---
+
+## 9. FRONTEND (React + Vite + react-leaflet)
+
+Plain CSS, projector-friendly (large fonts, high contrast), polling every 1.5 s, loading/error states everywhere, never crash on a null `currentOffer`.
+
+```
+client/src/
+  api.js  auth.jsx (context)  App.jsx
+  pages/ Login.jsx  PassengerHome.jsx  DriverHome.jsx  History.jsx  DemoPanel.jsx
+  components/ MapView.jsx  RideStatusStepper.jsx  DecisionPanel.jsx  EventTimeline.jsx
+              OfferCard.jsx  NotificationBell.jsx  FeatureFlagBadge.jsx
+```
+
+### 9.1 Login (requirement 1)
+Login and register (role picker; vehicle type/number for drivers). Show seeded demo credentials as a hint. Redirect by role.
+
+### 9.2 PassengerHome (requirements 3, 4, 5, 7, 9, 10)
+- Map click sets **pickup**, second click sets **destination**; "reset points" button. Optional search box using OSM Nominatim, triggered only by a button press with graceful failure (map click always works).
+- **Nearby drivers** markers and list with distance and ETA (refetch when pickup changes).
+- Estimate card: distance, duration, fare in INR with breakdown, nearest ETA, vehicle selector.
+- "Request ride" (disabled during an active ride). After requesting: **RideStatusStepper** (Requested, Accepted, Arriving, Ongoing, Completed; Offered/Unfulfilled/Cancelled handled gracefully), driver name and vehicle after acceptance, pickup ETA, fare, "Cancel ride" while cancellable, and a "No driver found, try again" state.
+- Route polylines from `/rides/:id/route`, fetched once per status change (not every poll).
+- Notification bell showing passenger notifications.
+
+### 9.3 DriverHome (requirements 2, 8, 9, 10)
+- **Online/Offline toggle** (disabled while `BUSY`); click the map to update own location.
+- Polls `/drivers/me/offer`: an **OfferCard** with pickup, drop, trip distance, fare, countdown, **Accept / Reject**.
+- Active ride panel with one large advance button labelled by the next step ("Start heading to pickup", "Start trip", "Complete trip") and the route on the map.
+
+### 9.4 History (requirement 10)
+Table of rides: date, route labels or coordinates, distance, status, estimated and final fare, other party's name; driver view shows total earnings.
+
+### 9.5 DemoPanel (visibility into the dispatch engine; `DEMO_MODE` only)
+- **DecisionPanel:** ranked table (rank, name, distance, ETA, score, factor bars), selected row highlighted, the `reason` string, `rankerUsed` and `fellBack` badges, countdown, `attemptCount/maxAttempts`.
+- **EventTimeline:** readable event names, timestamps, key payload fields.
+- **Simulator buttons** for the current pending offer: "Driver accepts", "Driver rejects", "Ignore (let it expire)", "Late accept" (sends accept for `lastExpiredOfferId`, expects 409, shows the message).
+- **Feature flag badge** showing current `RANKER` and `FAIR_DISPATCH_ENABLED` (read from a small `GET /api/v1/dev/config` returning non-secret settings).
+
+### 9.6 MapView
+OSM tiles, driver markers colored by status, pickup/drop markers, highlighted offered driver, route polylines, Leaflet default-icon fix for Vite, graceful fallback if tiles fail. Attribution to OpenStreetMap contributors must remain visible.
+
+---
+
+## 10. EXTENSION POINTS (design for these; do NOT build the features now)
+
+| Future feature | How it plugs in (no core rewrite) |
+|---|---|
+| **Fairness debt + multi-factor scoring** | New `rankers/fair.js`, `registerRanker("fair", ...)`, set `RANKER=fair`. Reads `driver.offersReceived`, `onlineSince`, `ridesCompleted`, `acceptRate` already on every candidate |
+| **Explainable allocation** | `ScoredDriver.factors` and `reason` already flow to the API, events and DemoPanel |
+| **Adaptive weights** | Weights from `ctx.config.weights`, `ctx.zone`, and `RANKER_WEIGHTS`; a function chooses a weight set per context |
+| **Simulation (nearest vs fair)** | A headless script in `simulation/` imports `src/rankers` and `src/services/geo.js`, replays the same synthetic ride sequence through each ranker, computes Jain's index and waiting-time metrics |
+| **Driver cancellation** | New route calling `recoverRide(rideId, "driver_cancelled")` plus a strategy entry; emits `DRIVER_CANCELLED` |
+| **Delayed arrival** | A check calling `recoverRide(rideId, "delayed_arrival")`; strategy compares revised ETA against alternatives |
+| **Driver offline detection** | Worker adds a check on `last_heartbeat`; calls `recoverRide(..., "driver_offline")` |
+| **Radius expansion / repeated-failure escalation** | A strategy in `recoveryStrategies` that increases radius via `ctx` |
+| **Zone intelligence / surge pricing** | Replace the stub in `zoneIntelligence.js` with an HTTP client; add the surge modifier to `fareModifiers` |
+| **Extra eligibility constraints** (rating, documents, seats) | Add a rule to `eligibilityRules` |
+| **Ride pooling** | New service consuming `RIDE_REQUESTED` from the event bus; a pool-aware ranker or pre-matching step |
+| **Real-time updates** | Subscribe a Server-Sent Events/WebSocket broadcaster to `eventBus`; replace polling |
+| **Kafka / external integration** | Subscribe a publisher to `eventBus`; events already carry `eventId` for idempotent consumers |
+| **Ratings, payments, promo codes** | New tables and modifiers; the ride and fare pipelines do not change |
+| **Teammates' services** | Their location/matching can call `POST /dispatch/allocate`; or replace the DB query inside `eligibility.js` |
+
+**Do not implement now:** fairness scoring, adaptive weights, simulation, pooling, WebSockets, Kafka, Redis, payments, OTP/email verification.
+
+---
+
+## 11. TESTS (`vitest` + `supertest`, against `TEST_DATABASE_URL`, tables truncated between tests)
+
+Use small timeouts via config overrides, a fixed 4-driver fixture, and `ROUTING_PROVIDER=haversine` in tests (no network).
+
+**auth.test.js**
+1. Register passenger and driver; login returns a token; wrong password returns 401.
+2. A passenger cannot call driver endpoints (403); a driver cannot create a ride (403); unauthenticated calls return 401.
+3. With `DEMO_MODE=false`, a driver cannot respond to another driver's offer (403).
+
+**dispatch.test.js**
+4. Accept path: ride `ACCEPTED`, `current_driver_id` set, driver `BUSY`, events `DRIVER_ACCEPTED` and `DRIVER_ASSIGNED` recorded.
+5. Reject then reassign: next offer goes to a **different** driver; the first is never re-offered.
+6. Timeout then reassign: backdate `expires_at`, run `expireStaleOffers()`; offer `EXPIRED`, new offer exists, `OFFER_EXPIRED` recorded.
+7. **Late accept:** expire then accept returns 409, ride unchanged, `LATE_RESPONSE_REJECTED` recorded.
+8. **Concurrent accept vs expire:** run both in parallel with `Promise.all`; exactly one wins and the ride ends in a consistent state.
+9. Max attempts: three rejections make the ride `UNFULFILLED` and a passenger notification exists.
+10. No eligible drivers (all `OFFLINE`): ride `UNFULFILLED`.
+11. Never two `PENDING` offers for one ride; accepting the same offer twice returns 200 idempotent for the same driver.
+12. `Idempotency-Key` on `POST /rides` returns the same ride on a repeat call.
+
+**lifecycle.test.js**
+13. Full path `ACCEPTED → ARRIVING → ONGOING → COMPLETED`; driver `AVAILABLE`, `rides_completed` incremented, `final_fare` set.
+14. Cannot skip a step; non-assigned driver gets 403.
+15. Fare calculation matches the formula for each vehicle type, with the breakdown stored.
+16. Passenger with an active ride cannot create another (409); a driver cannot hold two active rides (DB constraint).
+17. Availability toggle works; `BUSY` driver cannot go offline (409); an offline driver is excluded from nearby and eligibility.
+18. History returns only the caller's rides with fare fields.
+19. Cancel by passenger frees the driver and expires the pending offer.
+20. Routing fallback: when OSRM is unreachable (mock a failure), nearby and estimate still succeed with `source: "haversine"`.
+
+**extensibility.test.js**
+21. Registering a custom ranker (for example "reverse-nearest") and setting `RANKER` uses it; an unknown ranker name fails clearly at startup/config.
+22. A ranker that throws makes `rankWithFallback` use `nearest` with `fellBack: true`; the ride still gets an offer.
+23. With `FAIR_DISPATCH_ENABLED=false`, the nearest ranker is used regardless of `RANKER`.
+24. A custom eligibility rule added to the pipeline excludes the expected driver; a custom recovery strategy is invoked for its reason.
+25. `POST /dispatch/allocate` returns a ranked decision without creating offers; rejects a missing/incorrect service key.
+
+---
+
+## 12. BUILD PHASES (STOP AFTER EACH)
+
+### PHASE 1 — Foundation: data, auth, drivers, maps/routing, fare
+Steps:
+1. Monorepo scaffold (`server/`, `client/` placeholder), `package.json` scripts (`dev`, `migrate`, `seed`, `worker`, `test`), `.env.example`, config module, DB pool and `withTransaction`, migration runner and all migrations (Section 5 including the constraints).
+2. Auth (register/login/me), middleware (`requireAuth`, `requireRole`, validation, JSON error handler).
+3. Driver endpoints: availability, location, me, nearby.
+4. `geo`, `routing` (OSRM + cache + haversine fallback), `fare` (with modifier pipeline), `zoneIntelligence` stub, `events` (record + bus + notifications subscriber).
+5. `POST /rides/estimate` and `GET /dev/config`.
+6. `seed` with demo credentials.
+7. Tests 1 to 3, 15 (fare), 17 (availability/nearby), 20 (routing fallback).
+8. README: Postgres setup, env, migrate, seed, run.
+
+Verify (pasteable curl): register/login, toggle availability, nearby drivers sorted by distance, estimate with fare breakdown, routing falls back when `ROUTING_PROVIDER=haversine`.
+
+### PHASE 2 — Dispatch engine, ride lifecycle, history, integration API
+Steps:
+1. Rankers package (`base`, `nearest`, registry, `rankWithFallback`) and hooks (`eligibilityRules`, `recoveryStrategies`, `fareModifiers`).
+2. `eligibility`, `offers` (create, respond, expire), `recovery` (default strategy, `markUnfulfilled`), `rides` (advance, cancel), idempotency middleware.
+3. Routes: create ride, ride detail, events, route, cancel, advance, offer respond, driver offer and active-ride, history, notifications, `dispatch/allocate`, `dev/reset`.
+4. `worker.js` with graceful shutdown.
+5. Tests 4 to 14, 16, 18, 19, 21 to 25 (all passing).
+
+Verify (pasteable curl): request, reject, wait for expiry, accept, late accept returns 409, three rejections end `UNFULFILLED`, full progress to `COMPLETED`, history shows the fare, `dispatch/allocate` returns a ranking.
+
+### PHASE 3 — Frontend, demo, polish
+Steps:
+1. Vite React app per Section 9: auth context, Login, PassengerHome, DriverHome, History, DemoPanel and components.
+2. Leaflet map with route polylines, nearby drivers, offered-driver highlight, tile-failure fallback.
+3. Notification bell, countdowns, status stepper, loading/error states.
+4. Instructions to run Postgres, server, worker and client (three terminals), including `OFFER_TIMEOUT_SECONDS=8` for demos.
+5. **Demo script** with exact clicks: passenger logs in, picks pickup and destination, sees estimate and nearby drivers, requests; driver A rejects; driver B ignores and the offer expires; driver C accepts; ride advances through Arriving, Ongoing, Completed; history shows the fare; then DemoPanel shows the decision panel, event timeline, and a late accept being refused. Also include a second 30-second scenario: set `FAIR_DISPATCH_ENABLED=false` and show the booking flow still works.
+6. **Extensibility checklist** the AI must verify and report: adding a new ranker, eligibility rule, fare modifier, and recovery strategy each touches only its own file plus one registry line.
+
+Verify: all 10 core requirements work from the UI without terminal help.
+
+---
+
+## 13. DEFINITION OF DONE
+
+- All tests pass.
+- All 10 core requirements work from the UI.
+- The demo scenarios run end to end.
+- The booking flow works with `FAIR_DISPATCH_ENABLED=false`, with `ROUTING_PROVIDER=haversine`, and with the zone stub returning defaults.
+- No route handler changes a ride or offer status directly.
+- Every event has `eventId`, `eventType`, `occurredAt`, `rideId` (and `driverId`/`offerId` when relevant).
+- A new developer can follow the README and run everything in under 10 minutes.
+
+Begin with **Phase 1**. Before writing code, list in 5 lines or fewer any assumptions you are making.

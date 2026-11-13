@@ -1,0 +1,8 @@
+{
+  "name": "RideMatch Dispatch Platform",
+  "description": "Extensible ride-hailing and driver dispatch platform with swappable ranking, OSRM routing with haversine fallback, and PostgreSQL state machine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

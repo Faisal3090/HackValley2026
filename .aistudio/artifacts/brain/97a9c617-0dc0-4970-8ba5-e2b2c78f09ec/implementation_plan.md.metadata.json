@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan for Phase 2 of RideMatch (dispatch engine, swappable rankers, race-safe offer and ride state machine, background expiry worker, history/notifications, and integration API) plus alignment for Phase 3 UI.",
+  "updatedAt":  "2026-11-13T11:00:17.018510528Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
