@@ -46,7 +46,7 @@ const envSchema = z.object({
   MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
   SEARCH_RADIUS_KM: z.coerce.number().positive().default(5),
   AVG_SPEED_KMH: z.coerce.number().positive().default(25),
-  RANKER: z.string().min(1).default('nearest'),
+  RANKER: z.string().min(1).default('fairness'),
   RANKER_WEIGHTS: jsonFromEnv(z.record(z.string(), z.number()), {}),
   FAIR_DISPATCH_ENABLED: boolFromEnv(true),
   ROUTING_PROVIDER: z.enum(['osrm', 'haversine']).default('osrm'),
@@ -74,6 +74,7 @@ const envSchema = z.object({
   TRAFFIC_PREDICTION_ENABLED: boolFromEnv(true),
   INCIDENT_DEDUPE_RADIUS_METERS: z.coerce.number().positive().default(300),
   EMERGENCY_ROUTE_ENABLED: boolFromEnv(true),
+  REASSIGNMENT_MIN_SAVINGS_MIN: z.coerce.number().positive().default(5),
 });
 
 export function loadConfig(overrides = {}) {

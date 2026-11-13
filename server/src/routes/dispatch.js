@@ -7,6 +7,7 @@ import { validateBody } from '../middleware/validate.js';
 import { rankWithFallback } from '../rankers/index.js';
 import { filterProvidedCandidates } from '../services/eligibility.js';
 import { getZoneIntelligence } from '../services/zoneIntelligence.js';
+import { batchAllocate, reassignSlowRides } from '../services/marketplace.js';
 
 const allocateSchema = z.object({
   rideId: z.union([z.string(), z.number()]).transform(String),
@@ -46,6 +47,14 @@ const allocateSchema = z.object({
     )
     .default([]),
   zoneId: z.string().nullable().optional(),
+});
+
+const batchSchema = z.object({
+  rideIds: z.array(z.union([z.string(), z.number()])).min(1).max(10),
+});
+
+const reassignSchema = z.object({
+  rideIds: z.array(z.union([z.string(), z.number()])).max(10).optional(),
 });
 
 export function createDispatchRouter({ pool, config }) {
@@ -130,6 +139,14 @@ export function createDispatchRouter({ pool, config }) {
       });
     })
   );
+
+  router.post('/batch-allocate', requireServiceOrAdmin, validateBody(batchSchema), asyncHandler(async (req, res) => {
+    res.json(await batchAllocate({ rideIds: req.body.rideIds, pool, config }));
+  }));
+
+  router.post('/reassign-slow-rides', requireServiceOrAdmin, validateBody(reassignSchema), asyncHandler(async (req, res) => {
+    res.json(await reassignSlowRides({ rideIds: req.body.rideIds, pool, config }));
+  }));
 
   return router;
 }

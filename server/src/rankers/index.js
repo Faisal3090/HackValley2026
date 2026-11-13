@@ -1,7 +1,9 @@
 import { NearestRanker } from './nearest.js';
+import { FairnessRanker } from './fairness.js';
 
 export const registry = {
   nearest: new NearestRanker(),
+  fairness: new FairnessRanker(),
 };
 
 export function registerRanker(name, instance) {

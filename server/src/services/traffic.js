@@ -8,12 +8,15 @@ const risk = (score) => (score >= 0.75 ? 'HIGH' : score >= 0.45 ? 'MEDIUM' : 'LO
 
 function seededSegments(cfg) {
   const c = { lat: cfg.CITY_CENTER_LAT ?? CITY.lat, lng: cfg.CITY_CENTER_LNG ?? CITY.lng };
-  const names = ['Ring Road', 'Station Road', 'Market Junction', 'College Road', 'Airport Link', 'River Bridge'];
-  return names.map((name, i) => {
-    const a = { lat: c.lat + (i % 3 - 1) * 0.012, lng: c.lng + (i - 2) * 0.009 };
-    const b = { lat: a.lat + 0.008, lng: a.lng + 0.012 };
-    return { id: i + 1, name, fromNode: `N${i}`, toNode: `N${i + 1}`, start: a, end: b, lengthKm: 1.4 + i * 0.35, lanes: i % 3 + 1, capacity: 700 + i * 180 };
-  });
+  const roads = [
+    ['Ring Road', [[c.lng - 0.028, c.lat - 0.014], [c.lng, c.lat - 0.014], [c.lng + 0.028, c.lat - 0.014]]],
+    ['Station Road', [[c.lng - 0.018, c.lat - 0.025], [c.lng - 0.018, c.lat], [c.lng - 0.018, c.lat + 0.025]]],
+    ['Market Junction', [[c.lng - 0.008, c.lat - 0.025], [c.lng - 0.008, c.lat], [c.lng - 0.008, c.lat + 0.025]]],
+    ['College Road', [[c.lng + 0.004, c.lat - 0.025], [c.lng + 0.004, c.lat], [c.lng + 0.004, c.lat + 0.025]]],
+    ['Airport Link', [[c.lng + 0.016, c.lat - 0.025], [c.lng + 0.016, c.lat], [c.lng + 0.016, c.lat + 0.025]]],
+    ['River Bridge', [[c.lng - 0.028, c.lat + 0.012], [c.lng, c.lat + 0.012], [c.lng + 0.028, c.lat + 0.012]]],
+  ];
+  return roads.map(([name, coordinates], i) => ({ id: i + 1, name, fromNode: `N${i}`, toNode: `N${i + 1}`, coordinates, start: { lat: coordinates[0][1], lng: coordinates[0][0] }, end: { lat: coordinates.at(-1)[1], lng: coordinates.at(-1)[0] }, lengthKm: 1.4 + i * 0.35, lanes: i % 3 + 1, capacity: 700 + i * 180 }));
 }
 
 function predictionFor(segment, horizonMinutes, now = new Date()) {
@@ -25,10 +28,13 @@ function predictionFor(segment, horizonMinutes, now = new Date()) {
   return {
     segmentId: segment.id,
     name: segment.name,
-    geometry: { type: 'LineString', coordinates: [[segment.start.lng, segment.start.lat], [segment.end.lng, segment.end.lat]] },
+    geometry: { type: 'LineString', coordinates: segment.coordinates },
     congestionScore: Number(score.toFixed(3)),
     riskLevel: risk(score),
     confidence: Number((0.72 + (segment.id % 3) * 0.06).toFixed(2)),
+    capacityVehiclesPerHour: segment.capacity,
+    vehicleCount: Math.round(segment.capacity * score),
+    densityPercent: Math.round(score * 100),
     factors: { historical: 0.2 + segment.id * 0.02, timeOfDay: Number(rush.toFixed(2)), roadCapacity: segment.capacity, weather, incidents: incident },
     suggestedAction: score >= 0.75 ? 'Avoid this segment; use the alternate route.' : score >= 0.45 ? 'Expect slower traffic in 15–30 minutes.' : 'Normal flow expected.',
   };
@@ -50,6 +56,9 @@ export async function getTrafficOverview({ pool, config, horizon = 15 }) {
       riskLevel: row.risk_level,
       confidence: Number(row.confidence),
       factors: row.explanation || {},
+      capacityVehiclesPerHour: Number(row.explanation?.roadCapacity || 0),
+      vehicleCount: Number(row.explanation?.vehicleCount || 0),
+      densityPercent: Math.round(Number(row.congestion_score) * 100),
       horizonMinutes: row.horizon_minutes,
       suggestedAction: row.risk_level === 'HIGH' ? 'Avoid this segment; use the alternate route.' : row.risk_level === 'MEDIUM' ? 'Expect slower traffic in 15–30 minutes.' : 'Normal flow expected.',
     })), source: 'database' };
@@ -62,7 +71,7 @@ export async function refreshTrafficPredictions({ pool, config }) {
   const predictions = getDemoTraffic(config, 15).concat(getDemoTraffic(config, 30));
   try {
     for (const item of predictions) {
-      await pool.query(`INSERT INTO traffic_predictions (road_segment_id, predicted_for, horizon_minutes, congestion_score, risk_level, confidence, explanation) VALUES ($1, now() + ($2 * interval '1 minute'), $2, $3, $4, $5, $6)`, [item.segmentId, item.horizonMinutes, item.congestionScore, item.riskLevel, item.confidence, item.factors]);
+      await pool.query(`INSERT INTO traffic_predictions (road_segment_id, predicted_for, horizon_minutes, congestion_score, risk_level, confidence, explanation) VALUES ($1, now() + ($2 * interval '1 minute'), $2, $3, $4, $5, $6)`, [item.segmentId, item.horizonMinutes, item.congestionScore, item.riskLevel, item.confidence, JSON.stringify({ ...item.factors, vehicleCount: item.vehicleCount, roadCapacity: item.capacityVehiclesPerHour })]);
     }
     return predictions.length;
   } catch (error) { console.warn(`[traffic] refresh skipped: ${error.message}`); return 0; }

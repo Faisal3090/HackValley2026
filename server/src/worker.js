@@ -3,12 +3,14 @@ import pool from './db/pool.js';
 import { expireStaleOffers } from './services/offers.js';
 import { registerSubscribers } from './services/subscribers.js';
 import { refreshTrafficPredictions } from './services/traffic.js';
+import { reassignSlowRides } from './services/marketplace.js';
 
 registerSubscribers(pool);
 
 let stopping = false;
 let timer = null;
 let lastTrafficRefresh = 0;
+let lastReassignmentCheck = 0;
 
 async function tick() {
   if (stopping) return;
@@ -21,6 +23,11 @@ async function tick() {
       const count = await refreshTrafficPredictions({ pool, config });
       lastTrafficRefresh = Date.now();
       if (count) console.log(`[worker] Refreshed ${count} traffic prediction(s)`);
+    }
+    if (Date.now() - lastReassignmentCheck > 15000) {
+      const reassignment = await reassignSlowRides({ pool, config });
+      lastReassignmentCheck = Date.now();
+      if (reassignment.reassigned.length) console.log(`[worker] Reassigned ${reassignment.reassigned.length} traffic-delayed ride(s)`);
     }
   } catch (err) {
     console.error('[worker] Error expiring stale offers:', err);
