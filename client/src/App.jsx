@@ -21,6 +21,7 @@ import LiveMap from './pages/LiveMap.jsx';
 import Login from './pages/Login.jsx';
 import PassengerHome from './pages/PassengerHome.jsx';
 import RoleSelect from './pages/RoleSelect.jsx';
+import TrafficIntelligence from './pages/TrafficIntelligence.jsx';
 
 function ProtectedRoute({ children }) {
   const { user, loading } = useAuth();
@@ -92,6 +93,9 @@ function ShellLayout({ children }) {
           </NavLink>
           <NavLink to="/demo" className={({ isActive }) => `topbar-link ${isActive ? 'active' : ''}`}>
             Demo Panel
+          </NavLink>
+          <NavLink to="/traffic" className={({ isActive }) => `topbar-link ${isActive ? 'active' : ''}`}>
+            Traffic AI
           </NavLink>
         </nav>
 
@@ -181,6 +185,10 @@ export default function App() {
                 </ShellLayout>
               </ProtectedRoute>
             }
+          />
+          <Route
+            path="/traffic"
+            element={<ProtectedRoute><ShellLayout><TrafficIntelligence /></ShellLayout></ProtectedRoute>}
           />
           <Route path="*" element={<DefaultRedirect />} />
         </Routes>

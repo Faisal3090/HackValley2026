@@ -7,6 +7,7 @@ import { createNotificationsRouter } from './notifications.js';
 import { createDispatchRouter } from './dispatch.js';
 import { createDevRouter } from './dev.js';
 import { createPlacesRouter } from './places.js';
+import { createTrafficRouter } from './traffic.js';
 
 export function createApiRouter({ pool, config }) {
   const router = Router();
@@ -22,6 +23,7 @@ export function createApiRouter({ pool, config }) {
   router.use('/notifications', createNotificationsRouter({ pool, config }));
   router.use('/dispatch', createDispatchRouter({ pool, config }));
   router.use('/places', createPlacesRouter({ pool, config }));
+  router.use('/traffic', createTrafficRouter({ pool, config }));
   router.use('/dev', createDevRouter({ pool, config }));
 
   return router;

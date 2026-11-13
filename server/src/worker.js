@@ -2,11 +2,13 @@ import config from './config/index.js';
 import pool from './db/pool.js';
 import { expireStaleOffers } from './services/offers.js';
 import { registerSubscribers } from './services/subscribers.js';
+import { refreshTrafficPredictions } from './services/traffic.js';
 
 registerSubscribers(pool);
 
 let stopping = false;
 let timer = null;
+let lastTrafficRefresh = 0;
 
 async function tick() {
   if (stopping) return;
@@ -14,6 +16,11 @@ async function tick() {
     const { expiredCount } = await expireStaleOffers({ pool, config });
     if (expiredCount > 0) {
       console.log(`[worker] Expired ${expiredCount} stale offer(s)`);
+    }
+    if (config.TRAFFIC_PREDICTION_ENABLED !== false && Date.now() - lastTrafficRefresh > 300000) {
+      const count = await refreshTrafficPredictions({ pool, config });
+      lastTrafficRefresh = Date.now();
+      if (count) console.log(`[worker] Refreshed ${count} traffic prediction(s)`);
     }
   } catch (err) {
     console.error('[worker] Error expiring stale offers:', err);

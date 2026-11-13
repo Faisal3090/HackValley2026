@@ -71,6 +71,9 @@ const envSchema = z.object({
   SERVICE_API_KEY: z.string().min(1).default('dev-service-key'),
   CITY_CENTER_LAT: z.coerce.number().min(-90).max(90).default(15.8497),
   CITY_CENTER_LNG: z.coerce.number().min(-180).max(180).default(74.4977),
+  TRAFFIC_PREDICTION_ENABLED: boolFromEnv(true),
+  INCIDENT_DEDUPE_RADIUS_METERS: z.coerce.number().positive().default(300),
+  EMERGENCY_ROUTE_ENABLED: boolFromEnv(true),
 });
 
 export function loadConfig(overrides = {}) {
