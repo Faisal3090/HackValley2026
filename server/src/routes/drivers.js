@@ -6,6 +6,13 @@ import { requireRole } from '../middleware/roles.js';
 import { validateBody, validateQuery } from '../middleware/validate.js';
 import { haversineKm } from '../services/geo.js';
 import { getEtaMatrix } from '../services/routing.js';
+import { estimateEarnings } from '../services/earnings.js';
+
+const costSettingsSchema = z.object({
+  fuelCostPerKm: z.number().finite().min(0).max(1000),
+  maintenanceCostPerKm: z.number().finite().min(0).max(1000),
+  base: z.object({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180) }).nullable(),
+});
 
 const availabilitySchema = z.object({
   available: z.boolean(),
@@ -53,6 +60,25 @@ function formatDriver(row) {
 export function createDriversRouter({ pool, config }) {
   const router = Router();
   const requireAuth = createRequireAuth({ pool, cfg: config });
+
+  router.get('/me/cost-settings', requireAuth, requireRole('driver'), asyncHandler(async (req, res) => {
+    const { rows } = await pool.query('SELECT fuel_cost_per_km, maintenance_cost_per_km, base_lat, base_lng FROM drivers WHERE user_id = $1', [req.user.id]);
+    const d = rows[0];
+    if (!d) throw new AppError(404, 'DRIVER_NOT_FOUND', 'Driver profile not found');
+    res.json({ fuelCostPerKm: d.fuel_cost_per_km == null ? null : Number(d.fuel_cost_per_km),
+      maintenanceCostPerKm: d.maintenance_cost_per_km == null ? null : Number(d.maintenance_cost_per_km),
+      base: d.base_lat == null ? null : { lat: d.base_lat, lng: d.base_lng },
+      commissionPercent: Number(((1 - config.DRIVER_PAYOUT_PERCENT) * 100).toFixed(2)),
+    });
+  }));
+
+  router.put('/me/cost-settings', requireAuth, requireRole('driver'), validateBody(costSettingsSchema), asyncHandler(async (req, res) => {
+    const { fuelCostPerKm, maintenanceCostPerKm, base } = req.body;
+    const result = await pool.query(`UPDATE drivers SET fuel_cost_per_km = $1, maintenance_cost_per_km = $2, base_lat = $3, base_lng = $4 WHERE user_id = $5 RETURNING id`,
+      [fuelCostPerKm, maintenanceCostPerKm, base?.lat ?? null, base?.lng ?? null, req.user.id]);
+    if (!result.rows.length) throw new AppError(404, 'DRIVER_NOT_FOUND', 'Driver profile not found');
+    res.json({ saved: true });
+  }));
 
   router.post(
     '/me/availability',
@@ -172,8 +198,11 @@ export function createDriversRouter({ pool, config }) {
       }
 
       const o = rows[0];
+      const driverResult = await pool.query('SELECT * FROM drivers WHERE id = $1', [o.driver_id]);
+      const earnings = await estimateEarnings(o, driverResult.rows[0], config);
       return res.json({
         offer: {
+          earnings,
           id: o.id,
           rideId: o.ride_id,
           driverId: o.driver_id,
@@ -211,7 +240,7 @@ export function createDriversRouter({ pool, config }) {
     requireRole('driver'),
     asyncHandler(async (req, res) => {
       const { rows } = await pool.query(
-        `SELECT r.id
+        `SELECT r.id, r.earnings_snapshot
          FROM rides r
          JOIN drivers d ON d.id = r.current_driver_id
          WHERE d.user_id = $1
@@ -227,6 +256,7 @@ export function createDriversRouter({ pool, config }) {
 
       const { getRideDetail } = await import('../services/rides.js');
       const ride = await getRideDetail(rows[0].id, { pool, config });
+      ride.earnings = rows[0].earnings_snapshot;
       return res.json({ ride });
     })
   );

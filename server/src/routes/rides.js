@@ -252,9 +252,10 @@ export function createRidesRouter({ pool, config }) {
     '/:id/advance',
     requireAuth,
     requireRole('driver'),
+    validateBody(z.object({ actualPassengerDistanceKm: z.number().finite().min(0).max(10000).optional() }).default({})),
     asyncHandler(async (req, res) => {
       const rideId = parseRideId(req.params.id);
-      const ride = await advanceRide(rideId, req.user.id, { pool, config });
+      const ride = await advanceRide(rideId, req.user.id, { pool, config, actualPassengerDistanceKm: req.body.actualPassengerDistanceKm });
       res.json(ride);
     })
   );

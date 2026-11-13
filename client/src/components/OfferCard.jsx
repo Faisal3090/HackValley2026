@@ -1,4 +1,5 @@
 import React from 'react';
+import EarningsBreakdown from './EarningsBreakdown.jsx';
 
 export default function OfferCard({ offer, onRespond, busy }) {
   if (!offer) {
@@ -56,6 +57,7 @@ export default function OfferCard({ offer, onRespond, busy }) {
         </div>
       </div>
 
+      <EarningsBreakdown earnings={offer.earnings} />
       <div style={{ display: 'flex', gap: '10px' }}>
         <button
           type="button"

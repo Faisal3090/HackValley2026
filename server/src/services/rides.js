@@ -7,6 +7,7 @@ import { calculateFare } from './fare.js';
 import { createOffer } from './offers.js';
 import { getRoute } from './routing.js';
 import { getZoneIntelligence } from './zoneIntelligence.js';
+import { completeEarnings } from './earnings.js';
 
 export const TRANSITIONS = {
   REQUESTED: ['DRIVER_OFFERED', 'UNFULFILLED', 'CANCELLED'],
@@ -124,7 +125,7 @@ export async function createRide(
 export async function advanceRide(
   rideId,
   driverUserId,
-  { pool = defaultPool, config = defaultConfig } = {}
+  { pool = defaultPool, config = defaultConfig, actualPassengerDistanceKm = null } = {}
 ) {
   const events = [];
 
@@ -161,6 +162,9 @@ export async function advanceRide(
       );
     }
 
+    if (actualPassengerDistanceKm != null && (next.to !== 'COMPLETED' || !Number.isFinite(actualPassengerDistanceKm) || actualPassengerDistanceKm < 0 || actualPassengerDistanceKm > 10000)) {
+      throw new AppError(400, 'INVALID_ACTUAL_DISTANCE', 'Actual passenger distance is only accepted when completing a trip (0–10000 km).');
+    }
     const extraSet = next.to === 'COMPLETED' ? ', final_fare = estimated_fare' : '';
     const updRes = await client.query(
       `UPDATE rides
@@ -181,6 +185,9 @@ export async function advanceRide(
     }
 
     if (next.to === 'COMPLETED') {
+      const earnings = completeEarnings(ride.earnings_snapshot, Number(ride.estimated_fare), actualPassengerDistanceKm);
+      await client.query('UPDATE rides SET earnings_snapshot = $2::jsonb, actual_passenger_distance_km = $3 WHERE id = $1',
+        [ride.id, JSON.stringify(earnings), actualPassengerDistanceKm]);
       await client.query(
         `UPDATE drivers
          SET status = 'AVAILABLE',
@@ -467,7 +474,7 @@ export async function getRideHistory(user, { pool = defaultPool } = {}) {
             r.pickup_label, r.drop_label,
             r.pickup_lat, r.pickup_lng, r.drop_lat, r.drop_lng,
             r.vehicle_type, r.trip_distance_km,
-            r.estimated_fare, r.final_fare,
+            r.estimated_fare, r.final_fare, r.earnings_snapshot,
             r.created_at, r.completed_at,
             pu.name AS passenger_name,
             du.name AS driver_name
@@ -482,6 +489,7 @@ export async function getRideHistory(user, { pool = defaultPool } = {}) {
   );
 
   return rows.map((row) => ({
+    ...(user.role === 'driver' ? { earnings: row.earnings_snapshot } : {}),
     id: row.id,
     status: row.status,
     pickupLabel: row.pickup_label || '',

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { apiRequest } from '../api.js';
 import { useAuth } from '../auth.jsx';
+import EarningsBreakdown from '../components/EarningsBreakdown.jsx';
 
 export default function History() {
   const { token, user } = useAuth();
@@ -65,6 +66,7 @@ export default function History() {
                   <th className="num">Distance</th>
                   <th className="num">Est. Fare</th>
                   <th className="num">Final Fare</th>
+                  {user?.role === 'driver' && <th>Estimated net profit</th>}
                 </tr>
               </thead>
               <tbody>
@@ -101,6 +103,7 @@ export default function History() {
                           {r.finalFare != null ? `₹${r.finalFare}` : '—'}
                         </strong>
                       </td>
+                      {user?.role === 'driver' && <td>{r.earnings ? <EarningsBreakdown earnings={r.earnings} /> : 'No saved estimate'}</td>}
                     </tr>
                   );
                 })}

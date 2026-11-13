@@ -64,6 +64,11 @@ const envSchema = z.object({
     { AUTO: 0.8, HATCHBACK: 1.0, SEDAN: 1.2, SUV: 1.5 }
   ),
   DRIVER_PAYOUT_PERCENT: z.coerce.number().min(0).max(1).default(0.8),
+  EARNINGS_DEMAND_ZONES: jsonFromEnv(z.array(z.object({
+    name: z.string().min(1).max(100),
+    lat: z.number().min(-90).max(90),
+    lng: z.number().min(-180).max(180),
+  })).max(20), []),
   FARE_MULTIPLIER_MIN: z.coerce.number().positive().default(0.5),
   FARE_MULTIPLIER_MAX: z.coerce.number().positive().default(2.0),
   STALE_HEARTBEAT_SECONDS: z.coerce.number().nonnegative().default(45),

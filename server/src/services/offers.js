@@ -8,6 +8,7 @@ import { getEligibleCandidates } from './eligibility.js';
 import { publishAfterCommit, recordEvent } from './events.js';
 import { markUnfulfilled, recoverRide } from './recovery.js';
 import { getZoneIntelligence } from './zoneIntelligence.js';
+import { estimateEarnings } from './earnings.js';
 
 export async function createOffer(
   rideId,
@@ -293,6 +294,8 @@ export async function respondToOffer(
       }
 
       const acceptedRide = updRide.rows[0];
+      const earnings = await estimateEarnings(acceptedRide, updDriver.rows[0], config);
+      await client.query('UPDATE rides SET earnings_snapshot = $2::jsonb WHERE id = $1', [acceptedRide.id, JSON.stringify(earnings)]);
 
       events.push(
         await recordEvent(client, {

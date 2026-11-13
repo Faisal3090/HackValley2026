@@ -3,6 +3,8 @@ import { apiRequest } from '../api.js';
 import { useAuth } from '../auth.jsx';
 import MapView from '../components/MapView.jsx';
 import OfferCard from '../components/OfferCard.jsx';
+import EarningsBreakdown from '../components/EarningsBreakdown.jsx';
+import DriverCostSettings from '../components/DriverCostSettings.jsx';
 import RideStatusStepper from '../components/RideStatusStepper.jsx';
 
 const NEXT_STEP_LABEL = {
@@ -15,6 +17,8 @@ export default function DriverHome() {
   const { token, driver, setDriver } = useAuth();
   const [offer, setOffer] = useState(null);
   const [activeRide, setActiveRide] = useState(null);
+  const [actualDistance, setActualDistance] = useState('');
+  useEffect(() => setActualDistance(''), [activeRide?.id]);
   const [route, setRoute] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -139,6 +143,10 @@ export default function DriverHome() {
 
   const handleAdvance = async () => {
     if (!activeRide) return;
+    if (activeRide.status === 'ONGOING' && actualDistance !== '' && (!Number.isFinite(Number(actualDistance)) || Number(actualDistance) < 0 || Number(actualDistance) > 10000)) {
+      setError('Enter an actual passenger distance between 0 and 10000 km, or leave it empty.');
+      return;
+    }
     setBusy(true);
     setError('');
     setInfo('');
@@ -146,6 +154,7 @@ export default function DriverHome() {
       const updated = await apiRequest(`/rides/${activeRide.id}/advance`, {
         method: 'POST',
         token,
+        body: activeRide.status === 'ONGOING' && actualDistance !== '' ? { actualPassengerDistanceKm: Number(actualDistance) } : {},
       });
       setInfo(`Ride #${updated.id} moved to ${updated.status}`);
       await pollDriverState();
@@ -314,6 +323,7 @@ export default function DriverHome() {
             )}
           </div>
 
+          <DriverCostSettings token={token} driver={driver} onSaved={() => void pollDriverState()} />
           {!activeRide ? (
             <OfferCard
               offer={offer}
@@ -357,6 +367,12 @@ export default function DriverHome() {
                 </div>
               </div>
 
+              <EarningsBreakdown earnings={activeRide.earnings} />
+              {activeRide.status === 'ONGOING' && <label style={{ display: 'block', marginBottom: 12 }}>
+                Actual passenger distance (km, optional)
+                <input type="number" min="0" max="10000" step="any" value={actualDistance} onChange={(e) => setActualDistance(e.target.value)} style={{ display: 'block' }} />
+                <small>Enter the measured trip distance. Leave empty to keep the route estimate.</small>
+              </label>}
               {NEXT_STEP_LABEL[activeRide.status] && (
                 <button
                   type="button"
