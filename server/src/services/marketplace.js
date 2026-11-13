@@ -97,14 +97,16 @@ export async function batchAllocate({ rideIds, pool = defaultPool, config = defa
 
 export async function reassignSlowRides({ pool = defaultPool, config = defaultConfig, rideIds = null }) {
   const query = rideIds?.length
-    ? [`SELECT r.*, d.lat AS driver_lat, d.lng AS driver_lng FROM rides r JOIN drivers d ON d.id = r.current_driver_id WHERE r.id = ANY($1::int[]) AND r.status = ANY($2::text[]) AND d.lat IS NOT NULL AND d.lng IS NOT NULL`, [rideIds.map(Number), activeStatuses]]
-    : [`SELECT r.*, d.lat AS driver_lat, d.lng AS driver_lng FROM rides r JOIN drivers d ON d.id = r.current_driver_id WHERE r.status = ANY($1::text[]) AND d.lat IS NOT NULL AND d.lng IS NOT NULL`, [activeStatuses]];
+    ? [`SELECT r.*, d.lat AS driver_lat, d.lng AS driver_lng, d.last_heartbeat FROM rides r JOIN drivers d ON d.id = r.current_driver_id WHERE r.id = ANY($1::int[]) AND r.status = ANY($2::text[]) AND d.lat IS NOT NULL AND d.lng IS NOT NULL`, [rideIds.map(Number), activeStatuses]]
+    : [`SELECT r.*, d.lat AS driver_lat, d.lng AS driver_lng, d.last_heartbeat FROM rides r JOIN drivers d ON d.id = r.current_driver_id WHERE r.status = ANY($1::text[]) AND d.lat IS NOT NULL AND d.lng IS NOT NULL`, [activeStatuses]];
   const { rows } = await pool.query(...query);
   const reassigned = [];
 
   for (const ride of rows) {
     const pickup = pickupOf(ride);
-    const currentRoute = await getRoute({ lat: ride.driver_lat, lng: ride.driver_lng }, pickup, { config });
+    const heartbeatAgeSeconds = ride.last_heartbeat ? (Date.now() - new Date(ride.last_heartbeat).getTime()) / 1000 : Infinity;
+    const stale = config.STALE_HEARTBEAT_SECONDS > 0 && heartbeatAgeSeconds > config.STALE_HEARTBEAT_SECONDS;
+    const currentRoute = stale ? { durationMin: Number.POSITIVE_INFINITY } : await getRoute({ lat: ride.driver_lat, lng: ride.driver_lng }, pickup, { config });
     const availableRes = await pool.query(`SELECT d.*, u.name FROM drivers d JOIN users u ON u.id = d.user_id WHERE d.status = 'AVAILABLE' AND d.lat IS NOT NULL AND d.lng IS NOT NULL AND d.id <> $1`, [ride.current_driver_id]);
     const nearby = availableRes.rows.filter((driver) => (!ride.vehicle_type || driver.vehicle_type === ride.vehicle_type) && haversineKm(pickup, driver) <= config.SEARCH_RADIUS_KM);
     if (!nearby.length) continue;
@@ -121,17 +123,17 @@ export async function reassignSlowRides({ pool = defaultPool, config = defaultCo
       const locked = await client.query('SELECT * FROM rides WHERE id = $1 FOR UPDATE', [ride.id]);
       if (!locked.rows[0] || !activeStatuses.includes(locked.rows[0].status) || locked.rows[0].current_driver_id !== ride.current_driver_id) return null;
       const oldDriverId = ride.current_driver_id;
-      await client.query("UPDATE drivers SET status = 'AVAILABLE' WHERE id = $1 AND status = 'BUSY'", [oldDriverId]);
+      await client.query(`UPDATE drivers SET status = $1 WHERE id = $2 AND status = 'BUSY'`, [stale ? 'OFFLINE' : 'AVAILABLE', oldDriverId]);
       const newDriver = await client.query("UPDATE drivers SET status = 'BUSY' WHERE id = $1 AND status = 'AVAILABLE' RETURNING id", [alternative.driver.id]);
       if (!newDriver.rows[0]) return null;
       const updatedRide = await client.query(`UPDATE rides SET current_driver_id = $2, estimated_pickup_eta_min = $3, version = version + 1 WHERE id = $1 RETURNING *`, [ride.id, alternative.driver.id, alternative.etaMin]);
       await client.query("UPDATE offers SET status = 'REJECTED', responded_at = now(), version = version + 1 WHERE ride_id = $1 AND driver_id = $2 AND status = 'ACCEPTED'", [ride.id, oldDriverId]);
       const offer = await client.query(`INSERT INTO offers (ride_id, driver_id, status, expires_at, rank_position, score, decision_id, responded_at) VALUES ($1,$2,'ACCEPTED',now(),1,$3,$4,now()) RETURNING id`, [ride.id, alternative.driver.id, alternative.score, `REASSIGN-${crypto.randomUUID().slice(0, 8)}`]);
-      events.push(await recordEvent(client, { eventType: 'RIDE_REASSIGNED', rideId: ride.id, driverId: alternative.driver.id, offerId: offer.rows[0].id, payload: { fromDriverId: oldDriverId, toDriverId: alternative.driver.id, previousEtaMin: currentRoute.durationMin, newEtaMin: alternative.etaMin, timeSavedMin: Number(savings.toFixed(1)), reason: 'traffic_eta_degradation' } }));
+      events.push(await recordEvent(client, { eventType: 'RIDE_REASSIGNED', rideId: ride.id, driverId: alternative.driver.id, offerId: offer.rows[0].id, payload: { fromDriverId: oldDriverId, toDriverId: alternative.driver.id, previousEtaMin: Number.isFinite(currentRoute.durationMin) ? currentRoute.durationMin : null, newEtaMin: alternative.etaMin, timeSavedMin: Number.isFinite(savings) ? Number(savings.toFixed(1)) : null, reason: stale ? 'driver_connection_timeout' : 'traffic_eta_degradation' } }));
       return updatedRide.rows[0];
     }, pool);
     publishAfterCommit(events);
-    if (updated) reassigned.push({ rideId: ride.id, fromDriverId: ride.current_driver_id, toDriverId: alternative.driver.id, previousEtaMin: currentRoute.durationMin, newEtaMin: alternative.etaMin, timeSavedMin: Number(savings.toFixed(1)) });
+    if (updated) reassigned.push({ rideId: ride.id, fromDriverId: ride.current_driver_id, toDriverId: alternative.driver.id, previousEtaMin: Number.isFinite(currentRoute.durationMin) ? currentRoute.durationMin : null, newEtaMin: alternative.etaMin, timeSavedMin: Number.isFinite(savings) ? Number(savings.toFixed(1)) : null, reason: stale ? 'driver_connection_timeout' : 'traffic_eta_degradation' });
   }
   return { reassigned };
 }

@@ -12,6 +12,7 @@ import {
   useMap,
   useMapEvents,
 } from 'react-leaflet';
+import AnimatedDriverMarker from './AnimatedDriverMarker.jsx';
 
 // Fix default Leaflet marker asset URLs for Vite bundling
 delete L.Icon.Default.prototype._getIconUrl;
@@ -95,6 +96,7 @@ export default function MapView({
   onSelectRide = null,
   showLegend = false,
   instruction = '',
+  animatedDriver = null,
 }) {
   const [tileError, setTileError] = useState(false);
 
@@ -216,7 +218,16 @@ export default function MapView({
           </Marker>
         )}
 
-        {drivers.map((d) => {
+        {animatedDriver?.position && (
+          <AnimatedDriverMarker
+            geometry={animatedDriver.geometry}
+            driver={animatedDriver.driver}
+            phase={animatedDriver.phase}
+            durationMs={animatedDriver.durationMs}
+          />
+        )}
+
+        {drivers.filter((d) => Number(d.id) !== Number(animatedDriver?.driver?.id)).map((d) => {
           if (d.lat == null || d.lng == null) return null;
           const isOffered =
             (offeredDriverId != null && Number(d.id) === Number(offeredDriverId)) ||
@@ -270,7 +281,7 @@ export default function MapView({
           );
         })}
 
-        {selfDriver && selfDriver.lat != null && selfDriver.lng != null && (
+        {selfDriver && Number(selfDriver.id) !== Number(animatedDriver?.driver?.id) && selfDriver.lat != null && selfDriver.lng != null && (
           <Marker
             position={[selfDriver.lat, selfDriver.lng]}
             icon={createPinIcon({

@@ -293,6 +293,35 @@ export async function cancelRide(
   return getRideDetail(rideId, { pool, config });
 }
 
+export async function driverCancelRide(
+  rideId,
+  driverUserId,
+  { pool = defaultPool, config = defaultConfig } = {}
+) {
+  const events = [];
+  await withTransaction(async (client) => {
+    const rideRes = await client.query(
+      `SELECT r.*, d.id AS driver_id
+       FROM rides r JOIN drivers d ON d.id = r.current_driver_id
+       WHERE r.id = $1 AND d.user_id = $2 FOR UPDATE`,
+      [rideId, driverUserId]
+    );
+    if (!rideRes.rows[0]) throw new AppError(404, 'RIDE_NOT_FOUND', 'Assigned ride not found');
+    const ride = rideRes.rows[0];
+    if (!['ACCEPTED', 'ARRIVING'].includes(ride.status)) {
+      throw new AppError(409, 'INVALID_DRIVER_CANCEL', 'Driver can only cancel before the trip starts');
+    }
+    await client.query("UPDATE offers SET status = 'REJECTED', responded_at = now(), version = version + 1 WHERE ride_id = $1 AND driver_id = $2 AND status = 'ACCEPTED'", [ride.id, ride.driver_id]);
+    await client.query("UPDATE drivers SET status = 'AVAILABLE' WHERE id = $1", [ride.driver_id]);
+    await client.query("UPDATE rides SET status = 'REQUESTED', current_driver_id = NULL, accepted_at = NULL, arriving_at = NULL, version = version + 1 WHERE id = $1", [ride.id]);
+    events.push(await recordEvent(client, { eventType: 'DRIVER_CANCELLED', rideId: ride.id, driverId: ride.driver_id, payload: { previousStatus: ride.status, reason: 'driver_cancelled' } }));
+    events.push(await recordEvent(client, { eventType: 'RIDE_STATUS_CHANGED', rideId: ride.id, payload: { from: ride.status, to: 'REQUESTED', reason: 'driver_cancelled' } }));
+  }, pool);
+  publishAfterCommit(events);
+  await createOffer(rideId, { pool, config });
+  return getRideDetail(rideId, { pool, config });
+}
+
 export async function getRideDetail(
   rideId,
   { pool = defaultPool, config = defaultConfig } = {}

@@ -66,7 +66,7 @@ const envSchema = z.object({
   DRIVER_PAYOUT_PERCENT: z.coerce.number().min(0).max(1).default(0.8),
   FARE_MULTIPLIER_MIN: z.coerce.number().positive().default(0.5),
   FARE_MULTIPLIER_MAX: z.coerce.number().positive().default(2.0),
-  STALE_HEARTBEAT_SECONDS: z.coerce.number().nonnegative().default(0),
+  STALE_HEARTBEAT_SECONDS: z.coerce.number().nonnegative().default(45),
   DEMO_MODE: boolFromEnv(true),
   SERVICE_API_KEY: z.string().min(1).default('dev-service-key'),
   CITY_CENTER_LAT: z.coerce.number().min(-90).max(90).default(15.8497),

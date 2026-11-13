@@ -74,6 +74,8 @@ async function handleRideEvent(event, pool) {
     } else if (event.eventType === 'RIDE_REASSIGNED') {
       const saved = event.payload?.timeSavedMin;
       message = `Your driver was reassigned to reduce pickup time${saved != null ? ` by ${saved} minutes` : ''}`;
+    } else if (event.eventType === 'DRIVER_CANCELLED') {
+      message = 'Your driver cancelled; we are finding another driver now';
     } else if (event.eventType === 'RIDE_STATUS_CHANGED') {
       const to = event.payload?.to;
       if (to === 'ARRIVING') message = 'Your driver is on the way to pickup';

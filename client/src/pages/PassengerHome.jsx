@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { apiRequest } from '../api.js';
 import { useAuth } from '../auth.jsx';
 import MapView from '../components/MapView.jsx';
+import AnimatedMetric from '../components/AnimatedMetric.jsx';
 import PlaceSearch from '../components/PlaceSearch.jsx';
 import RideStatusStepper from '../components/RideStatusStepper.jsx';
 import { emitDispatchUpdated } from '../hooks/useDispatchToastNotifications.js';
@@ -17,8 +18,10 @@ export default function PassengerHome() {
   const [vehicleType, setVehicleType] = useState('');
   const [nearbyDrivers, setNearbyDrivers] = useState([]);
   const [estimate, setEstimate] = useState(null);
+  const [fareOptions, setFareOptions] = useState([]);
   const [activeRide, setActiveRide] = useState(null);
   const [route, setRoute] = useState(null);
+  const [paymentState, setPaymentState] = useState('idle');
 
   const [locationStatus, setLocationStatus] = useState('');
   const [focusPoint, setFocusPoint] = useState(null);
@@ -154,6 +157,25 @@ export default function PassengerHome() {
     };
   }, [token, pickup, drop, vehicleType, activeRide]);
 
+  useEffect(() => {
+    if (!token || !pickup || !drop || activeRide) {
+      setFareOptions([]);
+      return undefined;
+    }
+    let cancelled = false;
+    const types = ['AUTO', 'HATCHBACK', 'SEDAN', 'SUV'];
+    Promise.all(
+      types.map((type) => apiRequest('/rides/estimate', {
+        method: 'POST',
+        token,
+        body: { pickup: { lat: pickup.lat, lng: pickup.lng }, drop: { lat: drop.lat, lng: drop.lng }, vehicleType: type },
+      }).then((data) => ({ type, fare: data.estimatedFare, eta: data.tripDurationMin })))
+    ).then((options) => {
+      if (!cancelled) setFareOptions(options);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [token, pickup, drop, activeRide]);
+
   // Poll active ride every 1.5 seconds
   useEffect(() => {
     if (!token || !activeRide || TERMINAL_STATUSES.has(activeRide.status)) return;
@@ -214,6 +236,7 @@ export default function PassengerHome() {
     setPickup(null);
     setDrop(null);
     setEstimate(null);
+    setFareOptions([]);
     setNearbyDrivers([]);
     setRoute(null);
     setError('');
@@ -243,6 +266,7 @@ export default function PassengerHome() {
         },
       });
       setActiveRide(ride);
+      setPaymentState('idle');
       emitDispatchUpdated();
     } catch (err) {
       setError(err.message);
@@ -295,6 +319,27 @@ export default function PassengerHome() {
         status: 'AVAILABLE',
       }))
     : nearbyDrivers;
+
+  const animationPhase = activeRide?.status === 'ONGOING'
+    ? 'trip'
+    : activeRide?.status === 'ARRIVING'
+    ? 'pickup'
+    : null;
+  const animationGeometry = animationPhase === 'trip' ? route?.pickupToDrop : route?.driverToPickup;
+  const animatedDriver = animationPhase && activeRide?.currentDriver
+    ? {
+        driver: activeRide.currentDriver,
+        geometry: animationGeometry,
+        position: true,
+        phase: animationPhase,
+        durationMs: animationPhase === 'trip' ? 18000 : 12000,
+      }
+    : null;
+
+  const handlePayment = () => {
+    setPaymentState('processing');
+    window.setTimeout(() => setPaymentState('paid'), 1600);
+  };
 
   return (
     <div className="page-container">
@@ -409,25 +454,41 @@ export default function PassengerHome() {
                     <div className="kv-grid" style={{ marginBottom: '14px' }}>
                       <div className="kv-item">
                         <div className="kv-label">Estimated Fare</div>
-                        <div className="kv-value tabular">₹{estimate.estimatedFare}</div>
+                        <div className="kv-value tabular estimate-value"><AnimatedMetric value={estimate.estimatedFare} prefix="₹" decimals={0} /></div>
                       </div>
                       <div className="kv-item">
                         <div className="kv-label">Nearest Pickup ETA</div>
                         <div className="kv-value tabular">
-                          {estimate.nearestEtaMin != null ? `${estimate.nearestEtaMin} min` : 'No drivers'}
+                          {estimate.nearestEtaMin != null ? <AnimatedMetric value={estimate.nearestEtaMin} suffix=" min" /> : 'No drivers'}
                         </div>
                       </div>
                       <div className="kv-item">
                         <div className="kv-label">Distance</div>
-                        <div className="kv-value tabular">{estimate.tripDistanceKm} km</div>
+                        <div className="kv-value tabular"><AnimatedMetric value={estimate.tripDistanceKm} suffix=" km" /></div>
                       </div>
                       <div className="kv-item">
                         <div className="kv-label">Trip Duration</div>
-                        <div className="kv-value tabular">{estimate.tripDurationMin} min</div>
+                        <div className="kv-value tabular"><AnimatedMetric value={estimate.tripDurationMin} suffix=" min" /></div>
                       </div>
                     </div>
 
-                    <div className="meta-row" style={{ marginBottom: '14px' }}>
+                    {fareOptions.length > 0 && (
+                      <div className="fare-option-grid" aria-label="Fare by vehicle type">
+                        {fareOptions.map((option) => (
+                          <button
+                            type="button"
+                            key={option.type}
+                            className={`fare-option ${vehicleType === option.type || (!vehicleType && option.type === 'HATCHBACK') ? 'selected' : ''}`}
+                            onClick={() => setVehicleType(option.type)}
+                          >
+                            <span>{option.type}</span>
+                            <strong>₹{option.fare}</strong>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="meta-row fare-refresh-row" style={{ marginBottom: '14px' }}>
                       <span>Base ₹{estimate.fareBreakdown?.baseFare}</span>
                       <span aria-hidden="true">·</span>
                       <span>+ ₹{estimate.fareBreakdown?.perKmRate}/km</span>
@@ -437,6 +498,7 @@ export default function PassengerHome() {
                       </span>
                       <span aria-hidden="true">·</span>
                       <span>Route: {estimate.routeSource}</span>
+                      <span className="estimate-live-badge">Live estimate</span>
                     </div>
 
                     <button
@@ -502,6 +564,22 @@ export default function PassengerHome() {
               </div>
 
               <RideStatusStepper status={activeRide.status} />
+
+              {activeRide.status === 'COMPLETED' && paymentState !== 'paid' && (
+                <div className="payment-demo-card">
+                  <div className="payment-demo-icon">₹</div>
+                  <div>
+                    <strong>{paymentState === 'processing' ? 'Processing payment...' : 'Payment due'}</strong>
+                    <div className="meta-row">Demo checkout for Ride #{activeRide.id}</div>
+                  </div>
+                  {paymentState === 'idle' && <button type="button" className="btn btn-primary" onClick={handlePayment}>Pay ₹{activeRide.finalFare ?? activeRide.estimatedFare}</button>}
+                  {paymentState === 'processing' && <span className="payment-spinner" aria-label="Processing" />}
+                </div>
+              )}
+
+              {activeRide.status === 'COMPLETED' && paymentState === 'paid' && (
+                <div className="payment-demo-card payment-demo-success"><div className="payment-check">✓</div><div><strong>Payment completed</strong><div className="meta-row">Thank you for riding with KasuCab.</div></div></div>
+              )}
 
               {activeRide.status === 'DRIVER_OFFERED' && activeRide.currentOffer && (
                 <div className="alert alert-info" style={{ marginTop: '12px' }}>
@@ -594,6 +672,7 @@ export default function PassengerHome() {
           offeredDriverId={activeRide?.currentOffer?.driverId ?? null}
           assignedDriverId={activeRide?.currentDriver?.id ?? null}
           route={route}
+          animatedDriver={animatedDriver}
           onMapClick={handleMapClick}
           instruction={instruction}
         />

@@ -19,6 +19,9 @@ export default function DriverHome() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
+  const [cancelling, setCancelling] = useState(false);
+  const [simulationRunning, setSimulationRunning] = useState(false);
+  const [simulationStep, setSimulationStep] = useState('');
 
   const lastRouteKeyRef = useRef('');
 
@@ -132,6 +135,57 @@ export default function DriverHome() {
       setError(err.message);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleDriverCancel = async () => {
+    if (!activeRide) return;
+    setCancelling(true);
+    setError('');
+    try {
+      await apiRequest(`/rides/${activeRide.id}/driver-cancel`, { method: 'POST', token });
+      setInfo('Ride cancelled by driver. A replacement driver is being requested.');
+      await pollDriverState();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setCancelling(false);
+    }
+  };
+
+  const wait = (milliseconds) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+
+  const runFullRideSimulation = async () => {
+    if (!activeRide || !['ACCEPTED', 'ARRIVING', 'ONGOING'].includes(activeRide.status)) return;
+    setSimulationRunning(true);
+    setError('');
+    try {
+      let status = activeRide.status;
+      if (status === 'ACCEPTED') {
+        setSimulationStep('Driver is travelling to pickup...');
+        await apiRequest(`/rides/${activeRide.id}/advance`, { method: 'POST', token });
+        await pollDriverState();
+        status = 'ARRIVING';
+      }
+      if (status === 'ARRIVING') {
+        setSimulationStep('Passenger pickup simulation in progress...');
+        await wait(12000);
+        await apiRequest(`/rides/${activeRide.id}/advance`, { method: 'POST', token });
+        await pollDriverState();
+        status = 'ONGOING';
+      }
+      if (status === 'ONGOING') {
+        setSimulationStep('Trip to destination simulation in progress...');
+        await wait(18000);
+        await apiRequest(`/rides/${activeRide.id}/advance`, { method: 'POST', token });
+        await pollDriverState();
+      }
+      setSimulationStep('Simulation completed. Passenger can now pay.');
+    } catch (err) {
+      setError(err.message);
+      setSimulationStep('Simulation stopped because the ride state changed.');
+    } finally {
+      setSimulationRunning(false);
     }
   };
 
@@ -271,6 +325,19 @@ export default function DriverHome() {
                   {busy ? 'Updating...' : NEXT_STEP_LABEL[activeRide.status]}
                 </button>
               )}
+              {['ACCEPTED', 'ARRIVING', 'ONGOING'].includes(activeRide.status) && (
+                <>
+                  <button type="button" className="btn btn-success" style={{ marginTop: '10px' }} disabled={busy || simulationRunning} onClick={() => void runFullRideSimulation()}>
+                    {simulationRunning ? 'Simulation Running...' : 'Run Full Ride Simulation'}
+                  </button>
+                  {simulationStep && <div className="simulation-status" role="status">{simulationStep}</div>}
+                </>
+              )}
+              {['ACCEPTED', 'ARRIVING'].includes(activeRide.status) && (
+                <button type="button" className="btn btn-danger" style={{ marginTop: '10px' }} disabled={busy || cancelling} onClick={() => void handleDriverCancel()}>
+                  {cancelling ? 'Reassigning...' : 'Cancel & Reassign Ride'}
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -281,6 +348,7 @@ export default function DriverHome() {
           drop={activeRide?.drop ?? offer?.drop ?? null}
           selfDriver={driver}
           route={route}
+          animatedDriver={activeRide?.status === 'ARRIVING' ? { driver, geometry: route?.driverToPickup, position: true, phase: 'pickup', durationMs: 12000 } : activeRide?.status === 'ONGOING' ? { driver, geometry: route?.pickupToDrop, position: true, phase: 'trip', durationMs: 18000 } : null}
           onMapClick={(latlng) => void handleMapClick(latlng)}
           instruction="Click anywhere on the map to update your driver location"
         />

@@ -17,6 +17,7 @@ import {
   getRideDetail,
   getRideEvents,
   getRideHistory,
+  driverCancelRide,
 } from '../services/rides.js';
 
 const pointSchema = z.object({
@@ -265,6 +266,17 @@ export function createRidesRouter({ pool, config }) {
     asyncHandler(async (req, res) => {
       const rideId = parseRideId(req.params.id);
       const ride = await cancelRide(rideId, req.user.id, { pool, config });
+      res.json(ride);
+    })
+  );
+
+  router.post(
+    '/:id/driver-cancel',
+    requireAuth,
+    requireRole('driver'),
+    asyncHandler(async (req, res) => {
+      const rideId = parseRideId(req.params.id);
+      const ride = await driverCancelRide(rideId, req.user.id, { pool, config });
       res.json(ride);
     })
   );

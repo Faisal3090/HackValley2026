@@ -124,6 +124,11 @@ export function createDriversRouter({ pool, config }) {
     requireAuth,
     requireRole('driver'),
     asyncHandler(async (req, res) => {
+      await pool.query(
+        `UPDATE drivers SET last_heartbeat = now()
+         WHERE user_id = $1 AND status IN ('AVAILABLE', 'BUSY')`,
+        [req.user.id]
+      );
       const { rows } = await pool.query(
         `SELECT d.*, u.name
          FROM drivers d
